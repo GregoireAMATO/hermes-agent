@@ -27595,9 +27595,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # heartbeats (Discord shard, Telegram polling) until it returned.
     # See #16856.
     try:
+        import contextvars
         from tools.mcp_tool import discover_mcp_tools
+        from tools.registry import registry as _tool_registry
         _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
+        if getattr(runner.config, "multiplex_profiles", False):
+            from hermes_cli.profiles import profiles_to_serve
+
+            for _profile_name, _profile_home in profiles_to_serve(multiplex=True):
+                with _profile_runtime_scope(_profile_home), _tool_registry.profile_scope(_profile_home):
+                    _ctx = contextvars.copy_context()
+                    await _loop.run_in_executor(
+                        None, _ctx.run, discover_mcp_tools, _profile_home
+                    )
+        else:
+            await _loop.run_in_executor(None, discover_mcp_tools)
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 

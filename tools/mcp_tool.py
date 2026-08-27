@@ -110,6 +110,7 @@ import shutil
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -6209,7 +6210,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     from tools.registry import registry
 
     registered_names: List[str] = []
-    toolset_name = f"mcp-{name}"
+    logical_name = str(config.get("_hermes_logical_name") or name)
+    toolset_name = f"mcp-{logical_name}"
 
     # Selective tool loading: honour include/exclude lists from config.
     # Rules (matching issue #690 spec, extended with glob support):
@@ -6220,10 +6222,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     #   Neither set → register all tools (backward-compatible default)
     tools_filter = config.get("tools") or {}
     include_set = _normalize_name_filter(
-        tools_filter.get("include"), f"mcp_servers.{name}.tools.include"
+        tools_filter.get("include"), f"mcp_servers.{logical_name}.tools.include"
     )
     exclude_set = _normalize_name_filter(
-        tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude"
+        tools_filter.get("exclude"), f"mcp_servers.{logical_name}.tools.exclude"
     )
 
     def _should_register(tool_name: str) -> bool:
@@ -6252,7 +6254,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             continue
 
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
-        schema = _convert_mcp_schema(name, mcp_tool)
+        schema = _convert_mcp_schema(logical_name, mcp_tool)
         candidates.append(
             {
                 "registry_name": schema["name"],
@@ -6273,7 +6275,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         "list_prompts": _make_list_prompts_handler,
         "get_prompt": _make_get_prompt_handler,
     }
-    for entry in _select_utility_schemas(name, server, config):
+    for entry in _select_utility_schemas(logical_name, server, config):
         schema = entry["schema"]
         handler_key = entry["handler_key"]
         candidates.append(
@@ -6378,7 +6380,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         registered_names.append(registry_name)
 
     if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
+        registry.register_toolset_alias(logical_name, toolset_name)
         # Write-through (#56832): refresh the on-disk schema cache after a
         # live connect so the next startup can lazily register this server
         # without spawning it. Cache failures never break registration.
@@ -6403,10 +6405,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 })
             utility_payload = [
                 {"schema": entry["schema"], "handler_key": entry["handler_key"]}
-                for entry in _select_utility_schemas(name, server, config)
+                for entry in _select_utility_schemas(logical_name, server, config)
             ]
             write_cache_entry(
-                name,
+                logical_name,
                 config_fingerprint(config),
                 tools=tools_payload,
                 utility_tools=utility_payload,
@@ -6443,15 +6445,16 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     )
 
     registered_names: List[str] = []
-    toolset_name = f"mcp-{name}"
+    logical_name = str(config.get("_hermes_logical_name") or name)
+    toolset_name = f"mcp-{logical_name}"
     fingerprint = config_fingerprint(config)
     tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
     tools_filter = config.get("tools") or {}
     include_set = _normalize_name_filter(
-        tools_filter.get("include"), f"mcp_servers.{name}.tools.include"
+        tools_filter.get("include"), f"mcp_servers.{logical_name}.tools.include"
     )
     exclude_set = _normalize_name_filter(
-        tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude"
+        tools_filter.get("exclude"), f"mcp_servers.{logical_name}.tools.exclude"
     )
 
     def _should_register(tool_name: str) -> bool:
@@ -6493,7 +6496,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         # Defense-in-depth: the cache file is user-writable JSON, so run the
         # same injection scan the eager discovery path applies.
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
-        schema = _convert_mcp_schema(name, mcp_tool)
+        schema = _convert_mcp_schema(logical_name, mcp_tool)
         registry_name = schema["name"]
         existing_toolset = registry.get_toolset_for_tool(registry_name)
         if existing_toolset and existing_toolset != toolset_name:
@@ -6551,7 +6554,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         registered_names.append(util_name)
 
     if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
+        registry.register_toolset_alias(logical_name, toolset_name)
         with _lock:
             _lazy_server_configs[name] = dict(config)
             _lazy_server_fingerprints[name] = fingerprint
@@ -6842,7 +6845,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools() -> List[str]:
+def discover_mcp_tools(profile_home=None) -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
@@ -6862,6 +6865,23 @@ def discover_mcp_tools() -> List[str]:
     if not servers:
         logger.debug("No MCP servers configured")
         return []
+
+    # A multiplexed gateway keeps several independent profile configs in one
+    # process. Server registries are process-global for connection lifecycle,
+    # so give each profile an internal identity while preserving its logical
+    # server/toolset names in that profile's ToolRegistry overlay.
+    if profile_home is not None:
+        import hashlib
+
+        profile_key = str(Path(profile_home).resolve(strict=False))
+        prefix = hashlib.sha256(profile_key.encode("utf-8")).hexdigest()[:16]
+        servers = {
+            f"profile-{prefix}::{name}": {
+                **cfg,
+                "_hermes_logical_name": name,
+            }
+            for name, cfg in servers.items()
+        }
 
     # Cross-process discovery guard (#62771). A lock loser waits for
     # the holder, then performs its own process-local discovery. If locking is

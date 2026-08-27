@@ -16,6 +16,40 @@ from tools.registry import (
 )
 
 
+def test_profile_scoped_tools_with_same_name_do_not_leak(tmp_path):
+    """Multiplexed profiles get independent MCP handlers and schemas."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    reg = ToolRegistry()
+    homes = [tmp_path / "alpha", tmp_path / "beta"]
+    for home, marker in zip(homes, ("alpha", "beta")):
+        home.mkdir()
+        with reg.profile_scope(home):
+            reg.register(
+                name="mcp__shared__identify",
+                toolset="mcp-shared",
+                schema={"name": "mcp__shared__identify", "description": marker, "parameters": {}},
+                handler=lambda args, value=marker, **kw: value,
+            )
+
+    for home, marker in zip(homes, ("alpha", "beta")):
+        token = set_hermes_home_override(str(home))
+        try:
+            assert reg.get_schema("mcp__shared__identify")["description"] == marker
+            assert reg.dispatch("mcp__shared__identify", {}) == marker
+        finally:
+            reset_hermes_home_override(token)
+
+    other = tmp_path / "default"
+    other.mkdir()
+    token = set_hermes_home_override(str(other))
+    try:
+        assert reg.get_entry("mcp__shared__identify") is None
+        assert "mcp-shared" not in reg.get_registered_toolset_names()
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _dummy_handler(args, **kwargs):
     return json.dumps({"ok": True})
 

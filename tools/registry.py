@@ -21,10 +21,16 @@ import logging
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+_REGISTRATION_PROFILE: ContextVar[str | None] = ContextVar(
+    "tool_registration_profile", default=None
+)
 
 # Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
 _MAX_TOOL_ERROR_CHARS = 2048
@@ -416,6 +422,12 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: Dict[str, ToolEntry] = {}
+        # Multiplexed gateways may host profiles with identically named MCP
+        # servers.  Their entries must coexist without becoming process-wide
+        # capabilities. Built-ins remain in ``_tools``; only registrations
+        # made inside ``profile_scope`` land in this overlay.
+        self._profile_tools: Dict[str, Dict[str, ToolEntry]] = {}
+        self._profile_toolset_aliases: Dict[str, Dict[str, str]] = {}
         # Durable map: plugin module namespace (handler.__globals__["__name__"])
         # -> operator opt-in for built-in override. Populated at plugin load and
         # never cleared, so a plugin's override authorization is bound to the
@@ -438,7 +450,32 @@ class ToolRegistry:
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
         with self._lock:
-            return list(self._tools.values()), dict(self._toolset_checks)
+            entries = dict(self._tools)
+            profile = self._active_profile_key()
+            if profile:
+                entries.update(self._profile_tools.get(profile, {}))
+            return list(entries.values()), dict(self._toolset_checks)
+
+    @staticmethod
+    def _active_profile_key() -> Optional[str]:
+        explicit = _REGISTRATION_PROFILE.get()
+        if explicit:
+            return explicit
+        try:
+            from hermes_constants import get_hermes_home
+            return str(get_hermes_home().resolve(strict=False))
+        except Exception:
+            return None
+
+    @contextmanager
+    def profile_scope(self, profile_home: str | Path):
+        """Route registrations and lookups to one profile-local overlay."""
+        key = str(Path(profile_home).resolve(strict=False))
+        token = _REGISTRATION_PROFILE.set(key)
+        try:
+            yield
+        finally:
+            _REGISTRATION_PROFILE.reset(token)
 
     def _snapshot_entries(self) -> List[ToolEntry]:
         """Return a stable snapshot of registered tool entries."""
@@ -471,6 +508,11 @@ class ToolRegistry:
     def get_entry(self, name: str) -> Optional[ToolEntry]:
         """Return a registered tool entry by name, or None."""
         with self._lock:
+            profile = self._active_profile_key()
+            if profile:
+                entry = self._profile_tools.get(profile, {}).get(name)
+                if entry is not None:
+                    return entry
             return self._tools.get(name)
 
     def get_registered_toolset_names(self) -> List[str]:
@@ -487,23 +529,35 @@ class ToolRegistry:
     def register_toolset_alias(self, alias: str, toolset: str) -> None:
         """Register an explicit alias for a canonical toolset name."""
         with self._lock:
-            existing = self._toolset_aliases.get(alias)
+            profile = _REGISTRATION_PROFILE.get()
+            aliases = (
+                self._profile_toolset_aliases.setdefault(profile, {})
+                if profile else self._toolset_aliases
+            )
+            existing = aliases.get(alias)
             if existing and existing != toolset:
                 logger.warning(
                     "Toolset alias collision: '%s' (%s) overwritten by %s",
                     alias, existing, toolset,
                 )
-            self._toolset_aliases[alias] = toolset
+            aliases[alias] = toolset
             self._generation += 1
 
     def get_registered_toolset_aliases(self) -> Dict[str, str]:
         """Return a snapshot of ``{alias: canonical_toolset}`` mappings."""
         with self._lock:
-            return dict(self._toolset_aliases)
+            aliases = dict(self._toolset_aliases)
+            profile = self._active_profile_key()
+            if profile:
+                aliases.update(self._profile_toolset_aliases.get(profile, {}))
+            return aliases
 
     def get_toolset_alias_target(self, alias: str) -> Optional[str]:
         """Return the canonical toolset name for an alias, or None."""
         with self._lock:
+            profile = self._active_profile_key()
+            if profile and alias in self._profile_toolset_aliases.get(profile, {}):
+                return self._profile_toolset_aliases[profile][alias]
             return self._toolset_aliases.get(alias)
 
     # ------------------------------------------------------------------
@@ -583,7 +637,9 @@ class ToolRegistry:
         toolset are rejected to prevent accidental overwrites.
         """
         with self._lock:
-            existing = self._tools.get(name)
+            profile = _REGISTRATION_PROFILE.get()
+            tools = self._profile_tools.setdefault(profile, {}) if profile else self._tools
+            existing = tools.get(name)
             if existing and existing.toolset != toolset:
                 if override:
                     _owner = self._plugin_owner_of(handler)
@@ -620,7 +676,7 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
-            self._tools[name] = ToolEntry(
+            tools[name] = ToolEntry(
                 name=name,
                 toolset=toolset,
                 schema=schema,
@@ -660,7 +716,13 @@ class ToolRegistry:
         every refresh and has no plugin-override concept.
         """
         with self._lock:
-            entry = self._tools.get(name)
+            profile = _REGISTRATION_PROFILE.get()
+            tools = self._profile_tools.setdefault(profile, {}) if profile else self._tools
+            aliases = (
+                self._profile_toolset_aliases.setdefault(profile, {})
+                if profile else self._toolset_aliases
+            )
+            entry = tools.get(name)
             if entry is None:
                 return
             if not entry.toolset.startswith("mcp-"):
@@ -694,19 +756,23 @@ class ToolRegistry:
                         f"{name!r} (toolset {entry.toolset!r}) without operator "
                         f"opt-in (allow_tool_override)."
                     )
-            del self._tools[name]
+            del tools[name]
             # Drop the toolset check and aliases if this was the last tool in
             # that toolset.
             toolset_still_exists = any(
-                e.toolset == entry.toolset for e in self._tools.values()
+                e.toolset == entry.toolset for e in tools.values()
             )
             if not toolset_still_exists:
                 self._toolset_checks.pop(entry.toolset, None)
-                self._toolset_aliases = {
+                filtered_aliases = {
                     alias: target
-                    for alias, target in self._toolset_aliases.items()
+                    for alias, target in aliases.items()
                     if target != entry.toolset
                 }
+                if profile:
+                    self._profile_toolset_aliases[profile] = filtered_aliases
+                else:
+                    self._toolset_aliases = filtered_aliases
             self._generation += 1
         logger.debug("Deregistered tool: %s", name)
 
