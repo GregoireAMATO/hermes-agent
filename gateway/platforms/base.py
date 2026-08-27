@@ -6165,6 +6165,7 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_outcome = ProcessingOutcome.FAILURE
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -6678,6 +6679,9 @@ class BasePlatformAdapter(ABC):
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            delivery_outcome = (
+                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE
+            )
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(
@@ -6742,9 +6746,11 @@ class BasePlatformAdapter(ABC):
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
+            delivery_outcome = outcome
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
+            delivery_outcome = ProcessingOutcome.FAILURE
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
@@ -6787,6 +6793,34 @@ class BasePlatformAdapter(ABC):
                 "_hermes_run_generation",
                 None,
             )
+            # A newer run may replace the session guard while this task is
+            # unwinding.  Preserve the old generation in the payload, but do
+            # not let its successful platform ACK commit state owned by the
+            # replacement run.
+            _current_guard = self._active_sessions.get(session_key)
+            if _current_guard is not interrupt_event:
+                delivery_outcome = ProcessingOutcome.CANCELLED
+
+            try:
+                from hermes_cli.plugins import invoke_hook_async
+
+                await invoke_hook_async(
+                    "post_gateway_delivery",
+                    event=event,
+                    session_key=session_key,
+                    generation=_callback_generation,
+                    outcome=delivery_outcome.value,
+                    delivery_attempted=bool(delivery_attempted),
+                    delivery_succeeded=bool(delivery_succeeded),
+                )
+            except Exception:
+                # Plugin discovery/infrastructure failures get the same hard
+                # isolation as individual hook callback failures.
+                logger.warning(
+                    "[%s] post_gateway_delivery hook failed",
+                    self.name,
+                    exc_info=True,
+                )
             if hasattr(self, "pop_post_delivery_callback"):
                 _post_cb = self.pop_post_delivery_callback(
                     session_key,

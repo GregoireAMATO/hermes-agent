@@ -1,5 +1,6 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
+import asyncio
 import logging
 import json
 import sys
@@ -457,6 +458,46 @@ class TestPluginLoading:
 
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
+
+    @pytest.mark.asyncio
+    async def test_async_hook_supports_sync_and_async_callbacks(self):
+        mgr = PluginManager()
+
+        def sync_callback(**kwargs):
+            return ("sync", kwargs["value"])
+
+        async def async_callback(**kwargs):
+            await asyncio.sleep(0)
+            return ("async", kwargs["value"])
+
+        mgr._hooks["post_gateway_delivery"] = [sync_callback, async_callback]
+
+        assert await mgr.invoke_hook_async(
+            "post_gateway_delivery", value=3
+        ) == [("sync", 3), ("async", 3)]
+
+    @pytest.mark.asyncio
+    async def test_async_hook_timeout_and_error_are_isolated(self):
+        mgr = PluginManager()
+
+        async def slow_callback(**_kwargs):
+            await asyncio.Event().wait()
+
+        async def broken_callback(**_kwargs):
+            raise RuntimeError("plugin failure")
+
+        async def healthy_callback(**_kwargs):
+            return "healthy"
+
+        mgr._hooks["post_gateway_delivery"] = [
+            slow_callback,
+            broken_callback,
+            healthy_callback,
+        ]
+
+        assert await mgr.invoke_hook_async(
+            "post_gateway_delivery", timeout_seconds=0.01
+        ) == ["healthy"]
 
 
 

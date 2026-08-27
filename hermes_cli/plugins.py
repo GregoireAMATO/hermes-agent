@@ -144,6 +144,10 @@ VALID_HOOKS: Set[str] = {
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
+    # Fired once after a gateway turn's final delivery attempt.  This is an
+    # async lifecycle boundary: observers may persist delivery-dependent state
+    # without delaying or changing the platform send itself.
+    "post_gateway_delivery",
     # Verification-loop gate. Fired once per turn when the agent has edited code
     # and is about to verify/finish (after the verify-on-stop guard). A callback
     # may keep the agent going — run a check, defer it, tidy the diff — instead
@@ -2137,6 +2141,53 @@ class PluginManager:
                 )
         return results
 
+    async def invoke_hook_async(
+        self,
+        hook_name: str,
+        *,
+        timeout_seconds: float = 30.0,
+        **kwargs: Any,
+    ) -> List[Any]:
+        """Call plugin callbacks without blocking an async gateway loop.
+
+        Synchronous callbacks run in a worker thread.  Async callbacks run on
+        the current loop.  Each callback has an independent timeout and error
+        boundary so plugin work cannot prevent gateway cleanup.
+        """
+        results: List[Any] = []
+
+        for cb in self._hooks.get(hook_name, []):
+            async def _call_callback(callback: Callable[..., Any] = cb) -> Any:
+                if inspect.iscoroutinefunction(callback):
+                    return await callback(**kwargs)
+                ret = await asyncio.to_thread(callback, **kwargs)
+                if inspect.isawaitable(ret):
+                    return await ret
+                return ret
+
+            try:
+                ret = await asyncio.wait_for(
+                    _call_callback(),
+                    timeout=timeout_seconds,
+                )
+                if ret is not None:
+                    results.append(ret)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Hook '%s' callback %s timed out after %.1fs",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    timeout_seconds,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Hook '%s' callback %s raised: %s",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+        return results
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -2296,6 +2347,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+async def invoke_hook_async(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke a lifecycle hook from an async gateway path."""
+    return await get_plugin_manager().invoke_hook_async(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
