@@ -5201,7 +5201,11 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     success = False
     try:
-        success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
+        from gateway.run import run_until_gateway_teardown
+
+        success = run_until_gateway_teardown(
+            start_gateway(replace=replace, verbosity=verbosity)
+        )
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # On Windows-detached runs this shouldn't fire (we absorb SIGINT above),

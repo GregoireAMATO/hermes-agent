@@ -27857,7 +27857,7 @@ def main():
     # same os._exit backstop means EVERY exit path is wedge-proof, not just the
     # boolean-return ones.
     try:
-        success = asyncio.run(start_gateway(config))
+        success = run_until_gateway_teardown(start_gateway(config))
         exit_code = 0 if success else 1
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).
@@ -27868,6 +27868,24 @@ def main():
         else:
             exit_code = 1
     _exit_after_graceful_shutdown(exit_code)
+
+
+def run_until_gateway_teardown(coro):
+    """Run the gateway coroutine without joining the loop's default executor.
+
+    ``asyncio.run`` performs an implicit ``shutdown_default_executor`` before
+    returning. A wedged blocking call therefore prevents the caller from ever
+    reaching our deliberate ``os._exit`` backstop. Gateway teardown already
+    drains its owned resources; close the loop with ``wait=False`` semantics
+    and let the immediately-following hard exit reap any stuck worker.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 def _exit_after_graceful_shutdown(exit_code: int) -> None:

@@ -3,6 +3,35 @@ from unittest.mock import Mock
 
 import pytest
 
+
+def test_gateway_runner_closes_loop_without_default_executor_join(monkeypatch):
+    """The hard-exit backstop must be reachable with a wedged worker."""
+    import gateway.run as gateway_run
+
+    events = []
+
+    class Loop:
+        def run_until_complete(self, coro):
+            coro.close()
+            events.append("run")
+            return "done"
+
+        def close(self):
+            events.append("close")
+
+        def shutdown_default_executor(self):  # pragma: no cover - forbidden
+            raise AssertionError("would join a wedged worker")
+
+    loop = Loop()
+    monkeypatch.setattr(gateway_run.asyncio, "new_event_loop", lambda: loop)
+    monkeypatch.setattr(gateway_run.asyncio, "set_event_loop", lambda value: events.append(("set", value)))
+
+    async def gateway():
+        return True
+
+    assert gateway_run.run_until_gateway_teardown(gateway()) == "done"
+    assert events == [("set", loop), "run", ("set", None), "close"]
+
 import gateway.run as gateway_run
 
 

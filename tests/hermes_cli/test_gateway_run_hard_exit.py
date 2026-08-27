@@ -49,7 +49,8 @@ def test_run_gateway_hard_exits_after_clean_return(monkeypatch):
         coro.close()
         return True
 
-    monkeypatch.setattr(gateway_cli.asyncio, "run", _fake_run)
+    import gateway.run as gateway_run
+    monkeypatch.setattr(gateway_run, "run_until_gateway_teardown", _fake_run)
 
     with pytest.raises(_HardExitObserved) as excinfo:
         gateway_cli.run_gateway()
@@ -69,7 +70,8 @@ def test_run_gateway_hard_exits_after_keyboard_interrupt(monkeypatch):
         coro.close()
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(gateway_cli.asyncio, "run", _fake_run)
+    import gateway.run as gateway_run
+    monkeypatch.setattr(gateway_run, "run_until_gateway_teardown", _fake_run)
 
     with pytest.raises(_HardExitObserved) as excinfo:
         gateway_cli.run_gateway()
