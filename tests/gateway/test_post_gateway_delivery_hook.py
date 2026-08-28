@@ -84,9 +84,12 @@ async def test_success_emits_once_after_delivery(monkeypatch):
     assert payload["event"].message_id == "in-1"
     assert payload["session_key"] == build_session_key(_event().source)
     assert payload["generation"] == 7
+    assert payload["turn_id"] is None
     assert payload["outcome"] == "success"
     assert payload["delivery_attempted"] is True
     assert payload["delivery_succeeded"] is True
+    assert payload["outbound_message_id"] == "ok"
+    assert payload["outbound_message_ids"] == ("ok",)
 
 
 @pytest.mark.asyncio
@@ -114,6 +117,22 @@ async def test_chunked_adapter_emits_only_after_all_chunks(monkeypatch):
     assert adapter.send_calls == ["chu", "nked"]
     assert len(calls) == 1
     assert calls[0][1]["delivery_succeeded"] is True
+    assert calls[0][1]["outbound_message_id"] == "chunk-2"
+    assert calls[0][1]["outbound_message_ids"] == ("chunk-2",)
+
+
+@pytest.mark.asyncio
+async def test_split_delivery_exposes_all_outbound_message_ids(monkeypatch):
+    split = SendResult(
+        success=True,
+        message_id="part-3",
+        continuation_message_ids=("part-1", "part-2", "part-3"),
+    )
+    calls = await _run(DeliveryAdapter([split]), monkeypatch)
+
+    payload = calls[0][1]
+    assert payload["outbound_message_id"] == "part-3"
+    assert payload["outbound_message_ids"] == ("part-1", "part-2", "part-3")
 
 
 @pytest.mark.asyncio
@@ -130,6 +149,8 @@ async def test_retry_emits_once_for_final_success(monkeypatch):
     assert len(adapter.send_calls) == 2
     assert len(calls) == 1
     assert calls[0][1]["outcome"] == "success"
+    assert calls[0][1]["outbound_message_id"] == "retry-ok"
+    assert calls[0][1]["outbound_message_ids"] == ("retry-ok",)
 
 
 @pytest.mark.asyncio
@@ -140,6 +161,31 @@ async def test_no_delivery_still_emits_once(monkeypatch):
     assert calls[0][1]["outcome"] == "success"
     assert calls[0][1]["delivery_attempted"] is False
     assert calls[0][1]["delivery_succeeded"] is False
+    assert calls[0][1]["outbound_message_id"] is None
+    assert calls[0][1]["outbound_message_ids"] == ()
+
+
+@pytest.mark.asyncio
+async def test_turn_id_is_exposed_when_bound_to_gateway_turn(monkeypatch):
+    adapter = DeliveryAdapter()
+    event = _event()
+    session_key = build_session_key(event.source)
+    calls = []
+
+    async def capture(name, **payload):
+        calls.append((name, payload))
+
+    async def handler(_event):
+        guard = adapter._active_sessions[session_key]
+        guard._hermes_run_generation = 7
+        guard._hermes_turn_id = "turn-123"
+        return "answer"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", capture)
+    adapter.set_message_handler(handler)
+    await adapter._process_message_background(event, session_key)
+
+    assert calls[0][1]["turn_id"] == "turn-123"
 
 
 @pytest.mark.asyncio

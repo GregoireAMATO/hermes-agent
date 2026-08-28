@@ -6166,6 +6166,7 @@ class BasePlatformAdapter(ABC):
         delivery_attempted = False
         delivery_succeeded = False
         delivery_outcome = ProcessingOutcome.FAILURE
+        outbound_message_ids: List[str] = []
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -6174,6 +6175,21 @@ class BasePlatformAdapter(ABC):
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+                # Preserve every platform ACK associated with this turn.  A
+                # split delivery may expose the visible ids via
+                # continuation_message_ids and identify its final message via
+                # message_id.  Failed/retried attempts are deliberately not
+                # published as delivered messages.
+                _ids = [
+                    *tuple(getattr(result, "continuation_message_ids", ()) or ()),
+                    getattr(result, "message_id", None),
+                ]
+                for _message_id in _ids:
+                    if _message_id is None:
+                        continue
+                    _message_id = str(_message_id)
+                    if _message_id and _message_id not in outbound_message_ids:
+                        outbound_message_ids.append(_message_id)
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -6804,14 +6820,28 @@ class BasePlatformAdapter(ABC):
             try:
                 from hermes_cli.plugins import invoke_hook_async
 
+                _event_metadata = getattr(event, "metadata", None)
+                if not isinstance(_event_metadata, dict):
+                    _event_metadata = {}
+                _turn_id = (
+                    getattr(interrupt_event, "_hermes_turn_id", None)
+                    or getattr(event, "turn_id", None)
+                    or _event_metadata.get("turn_id")
+                )
+
                 await invoke_hook_async(
                     "post_gateway_delivery",
                     event=event,
                     session_key=session_key,
+                    turn_id=_turn_id,
                     generation=_callback_generation,
                     outcome=delivery_outcome.value,
                     delivery_attempted=bool(delivery_attempted),
                     delivery_succeeded=bool(delivery_succeeded),
+                    outbound_message_id=(
+                        outbound_message_ids[-1] if outbound_message_ids else None
+                    ),
+                    outbound_message_ids=tuple(outbound_message_ids),
                 )
             except Exception:
                 # Plugin discovery/infrastructure failures get the same hard
