@@ -13517,6 +13517,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if profile_name == active:
                 continue  # handled by the primary startup loop
             try:
+                # User plugins are profile-owned just like MCP tools. Load
+                # their hooks/tools under isolated overlays before the
+                # profile's adapters begin accepting messages.
+                from hermes_cli.plugins import discover_profile_plugins
+                from tools.registry import registry as _tool_registry
+
+                with _profile_runtime_scope(profile_home), _tool_registry.profile_scope(profile_home):
+                    discover_profile_plugins(profile_name, profile_home)
                 connected += await self._start_one_profile_adapters(
                     profile_name, profile_home, claimed
                 )
@@ -13693,6 +13701,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        # BasePlatformAdapter must know the owner before its message handler
+        # runs: it creates the active-session/delivery key first.  The handler
+        # below keeps its defensive source stamp, but is too late for that key.
+        adapter._hermes_profile_name = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -23655,6 +23667,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _bind_adapter_turn_id(
+        self,
+        adapter: Any,
+        session_key: str,
+        turn_id: str | None,
+        generation: int | None,
+    ) -> None:
+        """Correlate the completed agent turn with its delivery guard.
+
+        ``post_gateway_delivery`` runs after the profile/session context has
+        unwound, so the adapter guard is the durable in-process bridge between
+        the agent's turn-scoped authorization and the platform ACK.  Never
+        stamp a replacement guard owned by a newer run.
+        """
+        if not adapter or not session_key or not turn_id:
+            return
+        try:
+            interrupt_event = getattr(adapter, "_active_sessions", {}).get(
+                session_key
+            )
+            if interrupt_event is None:
+                return
+            if generation is not None and getattr(
+                interrupt_event, "_hermes_run_generation", None
+            ) != int(generation):
+                return
+            setattr(interrupt_event, "_hermes_turn_id", str(turn_id))
+        except Exception:
+            pass
+
     async def _interrupt_and_clear_session(
         self,
         session_key: str,
@@ -26226,6 +26268,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
             adapter = self._adapter_for_source(source)
+            self._bind_adapter_turn_id(
+                adapter,
+                session_key,
+                getattr(_agent, "_current_turn_id", None),
+                run_generation,
+            )
 
             # Finalize the streaming-TTS consumer (#60671).
             #

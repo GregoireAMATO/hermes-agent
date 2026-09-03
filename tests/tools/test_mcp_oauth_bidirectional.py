@@ -93,7 +93,11 @@ async def test_hermes_provider_forwards_asend_values(tmp_path, monkeypatch):
         callback_handler=_noop_callback,
     )
 
-    req = httpx.Request("POST", "https://example.com/mcp")
+    req = httpx.Request(
+        "POST",
+        "https://example.com/mcp",
+        headers={"User-Agent": "caller-selected-agent"},
+    )
     flow = provider.async_auth_flow(req)
 
     # First anext() drives the wrapper + inner generator until the inner
@@ -101,6 +105,7 @@ async def test_hermes_provider_forwards_asend_values(tmp_path, monkeypatch):
     outbound = await flow.__anext__()
     assert outbound is not None, "wrapper must yield the outbound request"
     assert outbound.url.host == "example.com"
+    assert outbound.headers["User-Agent"] == "caller-selected-agent"
 
     # Simulate httpx returning a 200 response.
     fake_response = httpx.Response(200, request=outbound)
@@ -192,6 +197,10 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
     assert isinstance(next_request, httpx.Request), (
         "wrapper must forward .asend() so the SDK's 401 branch can yield the "
         "next request in the discovery flow"
+    )
+    assert next_request.headers.get("User-Agent"), (
+        "SDK-generated OAuth discovery requests must carry a User-Agent so "
+        "CDN/WAF frontends do not reject them before OAuth discovery"
     )
 
     # Clean up the generator — we don't need to complete the full dance.

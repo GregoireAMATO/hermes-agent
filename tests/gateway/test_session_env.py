@@ -4,6 +4,7 @@ import os
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
@@ -74,6 +75,46 @@ def test_set_session_env_sets_contextvars(monkeypatch):
 
     # Clean up
     runner._clear_session_env(tokens)
+
+
+def test_event_message_id_reaches_session_context_when_source_omits_it():
+    """Adapter event IDs must survive the source-based session binding path."""
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="5",
+        chat_type="stream",
+        user_id="owner@example.com",
+        thread_id="A2/D1.82",
+    )
+
+    MessageEvent(text="Tu peux le faire ?", source=source, message_id="12345")
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:main:zulip:stream:5:topic:A2/D1.82",
+    )
+
+    tokens = runner._set_session_env(context)
+    try:
+        assert source.message_id == "12345"
+        assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "12345"
+    finally:
+        runner._clear_session_env(tokens)
+
+
+def test_event_message_id_preserves_explicit_source_anchor():
+    """A platform-specific source anchor remains authoritative when supplied."""
+    source = SessionSource(
+        platform=Platform.MATTERMOST,
+        chat_id="channel",
+        message_id="thread-root",
+    )
+
+    MessageEvent(text="reply", source=source, message_id="reply-post")
+
+    assert source.message_id == "thread-root"
 
 
 def test_clear_session_env_restores_previous_state(monkeypatch):
@@ -272,4 +313,3 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
 
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
-

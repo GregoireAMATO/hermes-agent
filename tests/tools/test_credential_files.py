@@ -14,8 +14,10 @@ from tools.credential_files import (
     iter_cache_files,
     iter_skills_files,
     map_cache_path_to_container,
+    map_skill_path_to_container,
     register_credential_file,
     register_credential_files,
+    to_agent_visible_skill_path,
 )
 
 
@@ -123,6 +125,59 @@ class TestSkillsDirectoryMount:
             mounts = get_skills_directory_mount()
 
         assert mounts[0]["host_path"] == str(skills_dir)
+
+    def test_maps_profile_skill_path_to_sandbox_mount(self, tmp_path):
+        hermes_home = tmp_path / "profiles" / "comptable"
+        script = (
+            hermes_home
+            / "skills"
+            / "finance"
+            / "urssaf-auto-entrepreneur"
+            / "scripts"
+            / "estimate_urssaf.py"
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            mapped = map_skill_path_to_container(str(script))
+
+        assert mapped == (
+            "/root/.hermes/skills/finance/urssaf-auto-entrepreneur/"
+            "scripts/estimate_urssaf.py"
+        )
+
+    def test_agent_visible_skill_path_depends_on_backend(self, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        script = hermes_home / "skills" / "demo" / "scripts" / "run.py"
+
+        with patch.dict(
+            os.environ,
+            {"HERMES_HOME": str(hermes_home), "TERMINAL_ENV": "docker"},
+        ):
+            assert to_agent_visible_skill_path(str(script)) == (
+                "/root/.hermes/skills/demo/scripts/run.py"
+            )
+
+        with patch.dict(
+            os.environ,
+            {"HERMES_HOME": str(hermes_home), "TERMINAL_ENV": "local"},
+        ):
+            assert to_agent_visible_skill_path(str(script)) == str(script)
+
+    def test_maps_external_skill_path_to_its_sandbox_namespace(self, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        external_root = tmp_path / "team-skills"
+        script = external_root / "finance" / "scripts" / "run.py"
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_root],
+            ),
+        ):
+            mapped = map_skill_path_to_container(str(script))
+
+        assert mapped == "/root/.hermes/external_skills/0/finance/scripts/run.py"
 
 
 class TestIterSkillsFiles:

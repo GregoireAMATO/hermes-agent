@@ -80,3 +80,34 @@ def test_explicit_skills_dir_monkeypatch_still_wins(tmp_path, monkeypatch):
 
     assert result["success"] is True
     assert Path(result["skill_dir"]) == patched_skill_dir
+
+
+def test_skill_view_exposes_docker_execution_dir(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profiles" / "comptable"
+    skill_dir = _write_skill(
+        profile_home,
+        "finance",
+        "urssaf-auto-entrepreneur",
+        "Urssaf profile",
+    )
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        skill_md.read_text(encoding="utf-8")
+        + "\nRun ${HERMES_SKILL_DIR}/scripts/estimate_urssaf.py.\n",
+        encoding="utf-8",
+    )
+
+    skills_tool = _reload_skills_tool(profile_home, monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+    result = json.loads(skills_tool.skill_view("urssaf-auto-entrepreneur"))
+
+    assert result["success"] is True
+    assert Path(result["skill_dir"]) == skill_dir
+    assert result["execution_dir"] == (
+        "/root/.hermes/skills/finance/urssaf-auto-entrepreneur"
+    )
+    assert (
+        "/root/.hermes/skills/finance/urssaf-auto-entrepreneur/"
+        "scripts/estimate_urssaf.py"
+    ) in result["content"]

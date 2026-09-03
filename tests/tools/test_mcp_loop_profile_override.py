@@ -108,3 +108,44 @@ def test_wrap_is_noop_without_override(mcp_loop):
     wrapped = mcp_loop._wrap_with_home_override(coro)
     assert wrapped is coro
     coro.close()
+
+
+@pytest.mark.asyncio
+async def test_multiplex_http_oauth_uses_profile_local_token_name(monkeypatch):
+    """The transport prefix must not leak into profile OAuth token lookup."""
+    import tools.mcp_oauth_manager as oauth_manager
+    from tools.mcp_tool import MCPServerTask
+
+    class ProbeComplete(Exception):
+        pass
+
+    captured = {}
+
+    class FakeManager:
+        def get_or_build_provider(self, server_name, server_url, oauth_config):
+            captured.update(
+                server_name=server_name,
+                server_url=server_url,
+                oauth_config=oauth_config,
+            )
+            raise ProbeComplete
+
+    monkeypatch.setattr(oauth_manager, "get_manager", lambda: FakeManager())
+
+    server = MCPServerTask("profile-deadbeef::abby")
+    server._auth_type = "oauth"
+    config = {
+        "url": "https://api.example.test/mcp",
+        "auth": "oauth",
+        "oauth": {"client_id": "profile-client"},
+        "_hermes_logical_name": "abby",
+    }
+
+    with pytest.raises(ProbeComplete):
+        await server._run_http(config)
+
+    assert captured == {
+        "server_name": "abby",
+        "server_url": config["url"],
+        "oauth_config": config["oauth"],
+    }

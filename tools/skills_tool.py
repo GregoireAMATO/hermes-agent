@@ -1728,6 +1728,19 @@ def skill_view(
                     exc_info=True,
                 )
 
+        execution_dir = str(skill_dir) if skill_dir else None
+        if execution_dir:
+            try:
+                from tools.credential_files import to_agent_visible_skill_path
+
+                execution_dir = to_agent_visible_skill_path(execution_dir)
+            except Exception:
+                logger.debug(
+                    "Could not map execution directory for skill %s",
+                    skill_name,
+                    exc_info=True,
+                )
+
         result = {
             "success": True,
             "name": skill_name,
@@ -1737,9 +1750,15 @@ def skill_view(
             "content": rendered_content,
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
+            "execution_dir": execution_dir,
             "org_provenance": org_provenance,
             "linked_files": linked_files if linked_files else None,
-            "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
+            "usage_hint": (
+                "To view linked files, call skill_view(name, file_path) where "
+                "file_path is e.g. 'references/api.md' or 'assets/config.yaml'. "
+                "Run bundled scripts from execution_dir, which is mapped for "
+                "the active terminal backend"
+            )
             if linked_files
             else None,
             "required_environment_variables": required_env_vars,

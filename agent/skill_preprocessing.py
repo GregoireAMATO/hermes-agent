@@ -50,6 +50,13 @@ def substitute_template_vars(
         return content
 
     skill_dir_str = str(skill_dir) if skill_dir else None
+    if skill_dir_str:
+        try:
+            from tools.credential_files import to_agent_visible_skill_path
+
+            skill_dir_str = to_agent_visible_skill_path(skill_dir_str)
+        except Exception:
+            logger.debug("Could not map skill directory for terminal", exc_info=True)
 
     def _replace(match: re.Match) -> str:
         token = match.group(1)

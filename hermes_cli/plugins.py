@@ -1337,6 +1337,10 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Non-empty only for a multiplex profile-local manager.  Directory
+        # modules need a distinct import namespace because two profiles may
+        # install different versions of a plugin with the same manifest key.
+        self._module_namespace_prefix: str = ""
 
     # -----------------------------------------------------------------------
     # Public
@@ -1919,6 +1923,8 @@ class PluginManager:
         from tools.registry import registry as _registry
         _plugin_id = manifest.key or manifest.name
         _slug = _plugin_id.replace("/", "__").replace("-", "_")
+        if self._module_namespace_prefix:
+            _slug = f"{self._module_namespace_prefix}__{_slug}"
         _registry.register_plugin_override_policy(
             f"{_NS_PARENT}.{_slug}",
             PluginContext(manifest, self)._tool_override_allowed(""),
@@ -2066,6 +2072,8 @@ class PluginManager:
 
         key = manifest.key or manifest.name
         slug = key.replace("/", "__").replace("-", "_")
+        if self._module_namespace_prefix:
+            slug = f"{self._module_namespace_prefix}__{slug}"
         module_name = f"{_NS_PARENT}.{slug}"
         spec = importlib.util.spec_from_file_location(
             module_name,
@@ -2313,6 +2321,12 @@ class PluginManager:
 # ---------------------------------------------------------------------------
 
 _plugin_manager: Optional[PluginManager] = None
+# Multiplex gateways keep user plugins alongside the profile that owns them.
+# The process-wide manager remains authoritative for the launch/default
+# profile and for bundled plugins; these overlays contain only plugins found
+# under ``<profile_home>/plugins``.
+_profile_plugin_managers_by_home: Dict[str, PluginManager] = {}
+_profile_plugin_managers_by_name: Dict[str, PluginManager] = {}
 
 
 def get_plugin_manager() -> PluginManager:
@@ -2321,6 +2335,104 @@ def get_plugin_manager() -> PluginManager:
     if _plugin_manager is None:
         _plugin_manager = PluginManager()
     return _plugin_manager
+
+
+def discover_profile_plugins(
+    profile_name: str,
+    profile_home: Union[str, Path],
+    *,
+    force: bool = False,
+) -> PluginManager:
+    """Load one multiplexed profile's user plugins into an isolated overlay.
+
+    The caller must enter that profile's Hermes-home, secret, and tool-registry
+    scopes first.  Bundled and entry-point plugins stay process-owned and are
+    loaded by the normal manager; rescanning them once per served profile would
+    duplicate global platform registrations and lifecycle callbacks.
+    """
+    home_key = str(Path(profile_home).resolve(strict=False))
+    manager = _profile_plugin_managers_by_home.get(home_key)
+    if manager is not None and manager._discovered and not force:
+        _profile_plugin_managers_by_name[profile_name] = manager
+        return manager
+
+    if manager is None or force:
+        manager = PluginManager()
+        digest = hashlib.sha256(home_key.encode("utf-8")).hexdigest()[:12]
+        manager._module_namespace_prefix = f"profile_{digest}"
+        _profile_plugin_managers_by_home[home_key] = manager
+    _profile_plugin_managers_by_name[profile_name] = manager
+
+    if env_var_enabled("HERMES_SAFE_MODE"):
+        manager._discovered = True
+        return manager
+
+    manager._discovered = True
+    try:
+        manifests = manager._scan_directory(Path(profile_home) / "plugins", source="user")
+        disabled = _get_disabled_plugins()
+        enabled = _get_enabled_plugins()
+        winners: Dict[str, PluginManifest] = {}
+        for manifest in manifests:
+            winners[manifest.key or manifest.name] = manifest
+
+        for lookup_key, manifest in winners.items():
+            if lookup_key in disabled or manifest.name in disabled:
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = "disabled via config"
+                manager._plugins[lookup_key] = loaded
+                continue
+            if manifest.kind in {"exclusive", "model-provider"}:
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = f"{manifest.kind} plugin uses its category discovery path"
+                manager._plugins[lookup_key] = loaded
+                continue
+            is_enabled = enabled is not None and (
+                lookup_key in enabled or manifest.name in enabled
+            )
+            if not is_enabled:
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = "not enabled in this profile's config"
+                manager._plugins[lookup_key] = loaded
+                continue
+            manager._load_plugin(manifest)
+    except BaseException:
+        manager._discovered = False
+        raise
+
+    if manifests:
+        logger.info(
+            "Profile plugin discovery complete for %s: %d found, %d enabled",
+            profile_name,
+            len(manager._plugins),
+            sum(1 for plugin in manager._plugins.values() if plugin.enabled),
+        )
+    return manager
+
+
+def _profile_plugin_manager_for_call(kwargs: Mapping[str, Any]) -> Optional[PluginManager]:
+    """Resolve the isolated manager for the current turn or delivery event."""
+    event = kwargs.get("event")
+    source = getattr(event, "source", None)
+    profile_name = str(getattr(source, "profile", "") or "").strip()
+    if profile_name and profile_name != "default":
+        manager = _profile_plugin_managers_by_name.get(profile_name)
+        if manager is not None:
+            return manager
+    try:
+        home_key = str(Path(get_hermes_home()).resolve(strict=False))
+    except Exception:
+        return None
+    return _profile_plugin_managers_by_home.get(home_key)
+
+
+def _managers_for_call(kwargs: Mapping[str, Any]) -> List[PluginManager]:
+    profile_manager = _profile_plugin_manager_for_call(kwargs)
+    if profile_manager is not None:
+        # Profiles are independent islands. A plugin enabled by the launch /
+        # default profile must not observe or alter a secondary profile's turn.
+        return [profile_manager]
+    return [get_plugin_manager()]
 
 
 def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
@@ -2346,12 +2458,18 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+    results: List[Any] = []
+    for manager in _managers_for_call(kwargs):
+        results.extend(manager.invoke_hook(hook_name, **kwargs))
+    return results
 
 
 async def invoke_hook_async(hook_name: str, **kwargs: Any) -> List[Any]:
     """Invoke a lifecycle hook from an async gateway path."""
-    return await get_plugin_manager().invoke_hook_async(hook_name, **kwargs)
+    results: List[Any] = []
+    for manager in _managers_for_call(kwargs):
+        results.extend(await manager.invoke_hook_async(hook_name, **kwargs))
+    return results
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
@@ -2359,21 +2477,26 @@ def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from middleware callbacks.
     """
-    return get_plugin_manager().invoke_middleware(kind, **kwargs)
+    results: List[Any] = []
+    for manager in _managers_for_call(kwargs):
+        results.extend(manager.invoke_middleware(kind, **kwargs))
+    return results
 
 
 def has_middleware(kind: str) -> bool:
     """Return True when middleware callbacks are registered for ``kind``."""
-    manager = get_plugin_manager()
-    method = getattr(manager, "has_middleware", None)
-    if callable(method):
-        return bool(method(kind))
-    return bool(getattr(manager, "_middleware", {}).get(kind))
+    for manager in _managers_for_call({}):
+        method = getattr(manager, "has_middleware", None)
+        if callable(method) and method(kind):
+            return True
+        if getattr(manager, "_middleware", {}).get(kind):
+            return True
+    return False
 
 
 def has_hook(hook_name: str) -> bool:
     """Return True when a loaded plugin handles a hook."""
-    return get_plugin_manager().has_hook(hook_name)
+    return any(manager.has_hook(hook_name) for manager in _managers_for_call({}))
 
 
 _thread_tool_whitelist = threading.local()

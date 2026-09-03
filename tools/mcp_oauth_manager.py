@@ -44,6 +44,24 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+_MCP_OAUTH_USER_AGENT = "HermesAgent/1.0"
+
+
+def _ensure_oauth_user_agent(request: Any) -> Any:
+    """Give SDK-generated OAuth requests a WAF-safe identity header.
+
+    Requests yielded from an ``httpx`` auth flow bypass the client's normal
+    default-header merge.  The MCP SDK therefore emits PRM/ASM discovery,
+    dynamic-registration, and token requests without ``User-Agent``.  Some
+    CDNs (including CloudFront in front of Abby) reject those requests before
+    they reach the OAuth server.  Preserve caller-provided identities and only
+    fill the missing header.
+    """
+    headers = getattr(request, "headers", None)
+    if headers is not None and not headers.get("User-Agent"):
+        headers["User-Agent"] = _MCP_OAUTH_USER_AGENT
+    return request
+
 
 def _same_endpoint(a: str, b: str) -> bool:
     """Return True if two URLs target the same endpoint (ignoring query/fragment).
@@ -418,13 +436,15 @@ def _make_hermes_provider_class() -> Optional[type]:
             # tests/tools/test_mcp_oauth_bidirectional.py.
             inner = super().async_auth_flow(request)
             try:
-                outgoing = await inner.__anext__()
+                outgoing = _ensure_oauth_user_agent(await inner.__anext__())
                 while True:
                     incoming = yield outgoing
                     # Sniff the response for a dead-client-registration signal
                     # before handing it back to the SDK (best-effort, GH#36767).
                     await self._maybe_flag_poisoned_client(incoming)
-                    outgoing = await inner.asend(incoming)
+                    outgoing = _ensure_oauth_user_agent(
+                        await inner.asend(incoming)
+                    )
             except StopAsyncIteration:
                 # Persist any metadata the SDK discovered lazily during the
                 # 401 branch so a subsequent cold-load skips discovery.

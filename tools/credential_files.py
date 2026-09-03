@@ -289,6 +289,69 @@ def get_skills_directory_mount(
     return mounts
 
 
+def map_skill_path_to_container(
+    host_path: str,
+    container_base: str = "/root/.hermes",
+) -> Optional[str]:
+    """Map a host skill path to the path mounted in a sandbox.
+
+    The model loads skills on the host, but Docker and file-sync backends expose
+    those same files under a backend-owned Hermes directory.  Returning the
+    host path in ``${HERMES_SKILL_DIR}`` therefore produces a command that can
+    never work in those sandboxes.  Keep this mapping beside the mount layout
+    so the two cannot drift.
+    """
+    path = Path(host_path).expanduser()
+    roots: list[tuple[Path, str]] = [
+        (
+            _resolve_hermes_home() / "skills",
+            f"{container_base.rstrip('/')}/skills",
+        )
+    ]
+    try:
+        from agent.skill_utils import get_external_skills_dirs
+
+        roots.extend(
+            (
+                Path(root),
+                f"{container_base.rstrip('/')}/external_skills/{index}",
+            )
+            for index, root in enumerate(get_external_skills_dirs())
+        )
+    except ImportError:
+        pass
+
+    for host_root, sandbox_root in roots:
+        try:
+            relative = path.relative_to(host_root)
+        except ValueError:
+            continue
+        return posixpath.join(sandbox_root, relative.as_posix())
+    return None
+
+
+def to_agent_visible_skill_path(
+    host_path: str,
+    container_base: str = "/root/.hermes",
+) -> str:
+    """Return the skill path visible to the active terminal backend.
+
+    Docker and Modal use ``/root/.hermes``.  File-sync backends use the remote
+    user's home, while local and Singularity executions can read the host path
+    directly.  This mirrors :func:`to_agent_visible_cache_path`.
+    """
+    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
+    if backend in ("docker", "modal"):
+        pass
+    elif backend in ("ssh", "daytona", "vercel_sandbox"):
+        container_base = "~/.hermes"
+    else:
+        return host_path
+
+    mapped = map_skill_path_to_container(host_path, container_base=container_base)
+    return mapped if mapped is not None else host_path
+
+
 _safe_skills_tempdir: Path | None = None
 
 
@@ -562,5 +625,3 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
-

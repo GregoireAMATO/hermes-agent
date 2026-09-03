@@ -517,6 +517,8 @@ def _hermetic_environment(tmp_path, monkeypatch):
     try:
         import hermes_cli.plugins as _plugins_mod
         monkeypatch.setattr(_plugins_mod, "_plugin_manager", None)
+        monkeypatch.setattr(_plugins_mod, "_profile_plugin_managers_by_home", {})
+        monkeypatch.setattr(_plugins_mod, "_profile_plugin_managers_by_name", {})
     except Exception:
         pass
     # Explicitly clear provider-specific base URL overrides that don't match

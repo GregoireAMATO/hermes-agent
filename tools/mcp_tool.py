@@ -2954,7 +2954,9 @@ class MCPServerTask:
             try:
                 from tools.mcp_oauth_manager import get_manager
                 _oauth_auth = get_manager().get_or_build_provider(
-                    self.name, url, config.get("oauth"),
+                    _oauth_storage_server_name(self.name, config),
+                    url,
+                    config.get("oauth"),
                 )
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
@@ -4215,15 +4217,22 @@ def _handle_auth_error_and_retry(
     from tools.mcp_oauth_manager import get_manager
     manager = get_manager()
 
+    with _lock:
+        oauth_server = _servers.get(server_name)
+    oauth_server_name = _oauth_storage_server_name(
+        server_name,
+        getattr(oauth_server, "_config", {}) or {},
+    )
+
     async def _recover():
-        return await manager.handle_401(server_name, None)
+        return await manager.handle_401(oauth_server_name, None)
 
     try:
         recovered = _run_on_mcp_loop(_recover, timeout=10)
     except Exception as rec_exc:
         logger.warning(
             "MCP OAuth '%s': recovery attempt failed: %s",
-            server_name, rec_exc,
+            oauth_server_name, rec_exc,
         )
         recovered = False
 
@@ -4271,7 +4280,7 @@ def _handle_auth_error_and_retry(
     _bump_server_error(server_name)
     return tool_error(
         f"MCP server '{server_name}' requires re-authentication. "
-        f"Run `hermes mcp login {server_name}` (or delete the tokens "
+        f"Run `hermes mcp login {oauth_server_name}` (or delete the tokens "
         f"file under ~/.hermes/mcp-tokens/ and restart). Do NOT retry "
         f"this tool — ask the user to re-authenticate.",
         needs_reauth=True,
@@ -5040,6 +5049,19 @@ def _load_mcp_config() -> Dict[str, dict]:
 # ---------------------------------------------------------------------------
 # Server connection helper
 # ---------------------------------------------------------------------------
+
+def _oauth_storage_server_name(server_name: str, config: dict) -> str:
+    """Return the profile-local name used by OAuth token storage.
+
+    Multiplex discovery prefixes the process-global transport identity so two
+    profiles can both own an MCP named ``abby``. OAuth manager keys already
+    include the active profile home, so carrying that transport prefix into
+    the token filename is both redundant and wrong: interactive login stores
+    ``abby.json`` in the profile while the gateway would otherwise look for
+    ``profile-<hash>::abby.json``.
+    """
+    return str(config.get("_hermes_logical_name") or server_name)
+
 
 async def _connect_server(name: str, config: dict) -> MCPServerTask:
     """Create an MCPServerTask, start it, and return when ready.

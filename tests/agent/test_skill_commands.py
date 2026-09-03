@@ -538,6 +538,29 @@ class TestTemplateVarSubstitution:
         # The literal template token must not leak through.
         assert "${HERMES_SKILL_DIR}" not in msg.split("[Skill directory:")[0]
 
+    def test_substitutes_sandbox_visible_skill_dir_for_docker(self, tmp_path):
+        hermes_home = tmp_path / "profiles" / "comptable"
+        skills_dir = hermes_home / "skills"
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            patch.dict(
+                os.environ,
+                {"HERMES_HOME": str(hermes_home), "TERMINAL_ENV": "docker"},
+            ),
+        ):
+            _make_skill(
+                skills_dir,
+                "templated",
+                body="Run: python3 ${HERMES_SKILL_DIR}/scripts/run.py",
+            )
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/templated")
+
+        assert msg is not None
+        assert "python3 /root/.hermes/skills/templated/scripts/run.py" in msg
+        assert "[Skill directory: /root/.hermes/skills/templated]" in msg
+        assert str(hermes_home) not in msg
+
 
 
     def test_disable_template_vars_via_config(self, tmp_path):

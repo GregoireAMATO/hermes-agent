@@ -2375,6 +2375,23 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    def __post_init__(self) -> None:
+        """Keep the event's triggering message ID on its session source.
+
+        Adapters historically populated either ``MessageEvent.message_id`` or
+        ``SessionSource.message_id``.  The gateway's per-turn tool context is
+        built from the source, so an event-only ID disappeared before scoped
+        write tokens were minted.  Preserve an explicit source anchor (some
+        threaded platforms use one), otherwise fill the documented triggering
+        message ID from the event.
+        """
+        if (
+            self.source is not None
+            and not self.source.message_id
+            and self.message_id is not None
+        ):
+            self.source.message_id = str(self.message_id)
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -5939,6 +5956,17 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        # A secondary-profile adapter owns its profile before the runner's
+        # message handler is entered.  Stamp that ownership before deriving
+        # the adapter guard/delivery key; doing it only in the runner creates
+        # an ``agent:main`` adapter key for a turn that is later persisted as
+        # ``agent:<profile>``, so post-delivery hooks cannot correlate them.
+        owned_profile = str(
+            getattr(self, "_hermes_profile_name", "") or ""
+        ).strip()
+        if owned_profile and not getattr(event.source, "profile", None):
+            setattr(event.source, "profile", owned_profile)
+
         coerce_plaintext_gateway_command(event)
 
         # Telegram topic recovery only applies to private DM topic lanes. Do
@@ -5956,6 +5984,7 @@ class BasePlatformAdapter(ABC):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=getattr(event.source, "profile", None),
         )
 
         # On-entry self-heal: if the adapter still has an _active_sessions
@@ -6167,7 +6196,6 @@ class BasePlatformAdapter(ABC):
         delivery_succeeded = False
         delivery_outcome = ProcessingOutcome.FAILURE
         outbound_message_ids: List[str] = []
-
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
             if result is None:
@@ -6712,7 +6740,6 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
-
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
             # this task hand off the follow-up.
@@ -6756,7 +6783,7 @@ class BasePlatformAdapter(ABC):
                     # Tests stub create_task() with non-hashable sentinels; tolerate.
                     pass
                 return  # Drain task owns the session now.
-                
+
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED

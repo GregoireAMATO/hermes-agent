@@ -7,6 +7,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 
 
@@ -186,6 +187,68 @@ async def test_turn_id_is_exposed_when_bound_to_gateway_turn(monkeypatch):
     await adapter._process_message_background(event, session_key)
 
     assert calls[0][1]["turn_id"] == "turn-123"
+
+
+def test_runner_binds_turn_id_only_to_matching_delivery_generation():
+    runner = object.__new__(GatewayRunner)
+    adapter = DeliveryAdapter()
+    session_key = "agent:cigre:zulip:stream:5:topic"
+    guard = asyncio.Event()
+    guard._hermes_run_generation = 7
+    adapter._active_sessions[session_key] = guard
+
+    runner._bind_adapter_turn_id(adapter, session_key, "turn-7", 7)
+    assert guard._hermes_turn_id == "turn-7"
+
+    replacement = asyncio.Event()
+    replacement._hermes_run_generation = 8
+    adapter._active_sessions[session_key] = replacement
+    runner._bind_adapter_turn_id(adapter, session_key, "stale-turn-7", 7)
+    assert not hasattr(replacement, "_hermes_turn_id")
+
+
+@pytest.mark.asyncio
+async def test_secondary_profile_key_survives_through_delivery_hook(
+    monkeypatch, tmp_path
+):
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = None
+    runner._busy_text_mode = "queue"
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir", lambda _name: tmp_path
+    )
+    monkeypatch.setattr(
+        runner, "_make_adapter_auth_check", lambda *_args, **_kwargs: None
+    )
+
+    adapter = DeliveryAdapter()
+    runner._configure_profile_adapter(adapter, "cigre", Platform.TELEGRAM)
+
+    event = _event()
+    expected_key = build_session_key(event.source, profile="cigre")
+    calls = []
+    delivered = asyncio.Event()
+
+    async def capture(name, **payload):
+        calls.append((name, payload))
+        delivered.set()
+
+    async def handler(_event):
+        guard = adapter._active_sessions[expected_key]
+        guard._hermes_run_generation = 7
+        guard._hermes_turn_id = "turn-cigre"
+        return "answer"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", capture)
+    adapter.set_message_handler(handler)
+
+    await adapter.handle_message(event)
+    await asyncio.wait_for(delivered.wait(), timeout=2)
+
+    assert event.source.profile == "cigre"
+    assert calls[0][0] == "post_gateway_delivery"
+    assert calls[0][1]["session_key"] == expected_key
+    assert calls[0][1]["turn_id"] == "turn-cigre"
 
 
 @pytest.mark.asyncio

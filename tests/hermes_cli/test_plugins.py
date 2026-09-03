@@ -1348,6 +1348,80 @@ class TestPluginContextProfileName:
         assert self._ctx().profile_name == "coder"
 
 
+class TestMultiplexProfilePlugins:
+    """Profile-local hooks are discovered and dispatched without leakage."""
+
+    def _write_hook_plugin(self, profile_home: Path) -> None:
+        plugin_dir = profile_home / "plugins" / "profile-hook"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "profile-hook",
+                    "version": "0.1.0",
+                    "hooks": ["pre_llm_call", "post_gateway_delivery"],
+                }
+            )
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "def register(ctx):\n"
+            "    ctx.register_hook('pre_llm_call', lambda **kw: 'profile')\n"
+            "    ctx.register_hook('post_gateway_delivery', lambda **kw: 'delivered')\n"
+        )
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["profile-hook"]}})
+        )
+
+    def test_sync_hook_uses_current_profile_overlay(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        default_home = tmp_path / "home"
+        profile_home = default_home / "profiles" / "worker"
+        profile_home.mkdir(parents=True)
+        self._write_hook_plugin(profile_home)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+        base = plugins_mod.get_plugin_manager()
+        base._hooks.setdefault("pre_llm_call", []).append(lambda **kw: "global")
+
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            plugins_mod.discover_profile_plugins("worker", profile_home)
+            assert plugins_mod.invoke_hook("pre_llm_call") == ["profile"]
+        finally:
+            reset_hermes_home_override(token)
+
+        assert plugins_mod.invoke_hook("pre_llm_call") == ["global"]
+
+    @pytest.mark.asyncio
+    async def test_delivery_event_selects_profile_after_turn_scope_ends(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import plugins as plugins_mod
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        default_home = tmp_path / "home"
+        profile_home = default_home / "profiles" / "worker"
+        profile_home.mkdir(parents=True)
+        self._write_hook_plugin(profile_home)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            plugins_mod.discover_profile_plugins("worker", profile_home)
+        finally:
+            reset_hermes_home_override(token)
+
+        event = types.SimpleNamespace(
+            source=types.SimpleNamespace(profile="worker")
+        )
+        results = await plugins_mod.invoke_hook_async(
+            "post_gateway_delivery", event=event
+        )
+        assert results == ["delivered"]
+
+
 class TestDispatchToolWithoutCliRef:
     """ctx.dispatch_tool works in worker/hook contexts (no _cli_ref).
 

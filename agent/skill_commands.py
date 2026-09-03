@@ -298,6 +298,14 @@ def _build_skill_message(
     from tools.skills_tool import SKILLS_DIR
 
     content = str(loaded_skill.get("content") or "")
+    visible_skill_dir = str(skill_dir) if skill_dir else None
+    if visible_skill_dir:
+        try:
+            from tools.credential_files import to_agent_visible_skill_path
+
+            visible_skill_dir = to_agent_visible_skill_path(visible_skill_dir)
+        except Exception:
+            pass
 
     # ── Template substitution and inline-shell expansion ──
     # Done before anything else so downstream blocks (setup notes,
@@ -315,7 +323,7 @@ def _build_skill_message(
     #    bundled scripts without an extra skill_view() round-trip. ──
     if skill_dir:
         parts.append("")
-        parts.append(f"[Skill directory: {skill_dir}]")
+        parts.append(f"[Skill directory: {visible_skill_dir}]")
         parts.append(
             "Resolve any relative paths in this skill (e.g. `scripts/foo.js`, "
             "`templates/config.yaml`) against that directory, then run them "
@@ -371,11 +379,18 @@ def _build_skill_message(
         parts.append("")
         parts.append("[This skill has supporting files:]")
         for sf in supporting:
-            parts.append(f"- {sf}  ->  {skill_dir / sf}")
+            if visible_skill_dir == str(skill_dir):
+                executable_path = str(skill_dir / sf)
+            else:
+                executable_path = (
+                    f"{str(visible_skill_dir).rstrip('/')}/"
+                    f"{str(sf).replace(os.sep, '/')}"
+                )
+            parts.append(f"- {sf}  ->  {executable_path}")
         parts.append(
             f'\nLoad any of these with skill_view(name="{skill_view_target}", '
             f'file_path="<path>"), or run scripts directly by absolute path '
-            f"(e.g. `node {skill_dir}/scripts/foo.js`)."
+            f"(e.g. `node {visible_skill_dir}/scripts/foo.js`)."
         )
 
     stable_prefix = None
